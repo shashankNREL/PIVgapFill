@@ -313,8 +313,9 @@ def compute_phased_coefficients(epoch, total_epochs, max_beta, max_gamma,
 
     elif epoch < phase2_end:
         # ---- Phase 2: sigmoid beta ramp, gamma still 0 ----
-        # Normalise epoch position within phase to [0, 1]
-        t = (epoch - phase1_end) / max(1, phase2_end - phase1_end - 1)
+        # Normalise epoch position within phase to [0, 1]; denominator is the
+        # full phase length so t reaches 1.0 at the start of Phase 3.
+        t = (epoch - phase1_end) / max(1, phase2_end - phase1_end)
         # Sigmoid centred at t=0.5; normalised so output spans [0, 1]
         raw_lo = _sigmoid(-sigmoid_k * 0.5)
         raw_hi = _sigmoid(sigmoid_k * 0.5)
@@ -325,8 +326,10 @@ def compute_phased_coefficients(epoch, total_epochs, max_beta, max_gamma,
 
     else:
         # ---- Phase 3: beta frozen, linear gamma ramp ----
-        phase3_len = max(1, total_epochs - phase2_end)
-        t = (epoch - phase2_end) / phase3_len
+        # Use (phase3_len - 1) as denominator so gamma reaches max_gamma
+        # exactly on the final epoch (epoch = total_epochs - 1).
+        phase3_len = total_epochs - phase2_end
+        t = (epoch - phase2_end) / max(1, phase3_len - 1)
         current_beta = max_beta
         current_gamma_base = max_gamma * min(t, 1.0)
         phase_label = "P3-Vort"
@@ -640,7 +643,7 @@ def tune_hyperparameters_phased(data_dict, num_samples=10, max_num_epochs=100, o
         "dropout_rate": tune.uniform(0.1, 0.3),
         "leaky_relu_slope": tune.uniform(0.1, 0.3),
         # Phase scheduling
-        "max_beta": tune.loguniform(1.0, 5.0),
+        "max_beta": tune.loguniform(0.5, 10.0),
         "max_gamma": tune.loguniform(1e-7, 1e-5),
         "beta_warm": 1e-4,
         "phase1_frac": tune.uniform(0.10, 0.30),
@@ -697,7 +700,7 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output', dest='oFile', type=str, default='CVAEoutput_phased.pkl')
     # 3-phase loss scaling parameters
     parser.add_argument('--max_beta', type=float, default=5.0,
-                        help='Maximum beta (KLD weight) – aim for β·KLD ≈ 10-30%% of BCE (default: 5.0)')
+                        help='Maximum beta (KLD weight); aim for weighted term β·KLD to be 10-30%% of BCE magnitude (default: 5.0)')
     parser.add_argument('--max_gamma', type=float, default=1e-6,
                         help='Maximum gamma_base (vorticity loss weight) (default: 1e-6)')
     parser.add_argument('--beta_warm', type=float, default=1e-4,
