@@ -4,12 +4,22 @@ PIV Gap-Fill CVAE with 3-Phase Loss Scaling Schedule
 Implements the strategy described in loss_scaling_plan.md:
 
   Phase 1 (0 – 20% of epochs):   beta = beta_warm (1e-4), gamma_base = 0
-  Phase 2 (20% – 60% of epochs): beta sigmoid-ramp 0 → max_beta, gamma_base = 0
+  Phase 2 (20% – 60% of epochs): beta cyclical annealing 0 → max_beta (n_cycles), gamma_base = 0
   Phase 3 (60% – 100% of epochs):beta = max_beta (frozen), gamma_base linear 0 → max_gamma
 
 User-tunable parameters:
-  --max_beta   (default 5.0)
-  --max_gamma  (default 1e-6)
+  --max_beta      (default 0.08; equivalent to old 5.0 with mean-KLD when latent_size=64)
+  --max_gamma     (default 1e-6)
+  --lambda_free   free-bits floor per latent dim in nats (default 0.5)
+  --skip_noise_std  std of Gaussian noise injected into skip connections during training (default 0.05)
+  --n_cycles      number of beta annealing cycles in Phase 2 (default 4)
+
+KLD notes
+---------
+KLD is now computed as sum over latent dims, then mean over batch (previously it was
+mean over both dims and batch, which divided by latent_size and masked the collapse).
+This increases the raw KLD value by ~latent_size, so max_beta should be adjusted
+accordingly (e.g. latent_size=64 with old max_beta=5 → new max_beta ≈ 0.08).
 
 Raw magnitudes of BCE and VortMSE are printed every epoch to aid calibration.
 """
@@ -51,12 +61,12 @@ class VariableHandler:
 
 
 # ---------------------------------------------------------------------------
-# Model – identical to original (no changes needed)
+# Model
 # ---------------------------------------------------------------------------
 
 class CVAE(nn.Module):
     def __init__(self, latent_size, num_labels, ImgSizeX, ImgSizeY,
-                 leaky_relu_slope=0.2, dropout_rate=0.2, vh=None):
+                 leaky_relu_slope=0.2, dropout_rate=0.2, skip_noise_std=0.05, vh=None):
         super().__init__()
         self.vh = vh if vh is not None else VariableHandler()
 
@@ -64,7 +74,8 @@ class CVAE(nn.Module):
         self.encoder = Encoder(latent_size, num_labels, ImgSizeX, ImgSizeY,
                                leaky_relu_slope, dropout_rate).to(device=self.vh.device, dtype=self.vh.dtype)
         self.decoder = Decoder(latent_size, num_labels,
-                               leaky_relu_slope, dropout_rate).to(device=self.vh.device, dtype=self.vh.dtype)
+                               leaky_relu_slope, dropout_rate,
+                               skip_noise_std=skip_noise_std).to(device=self.vh.device, dtype=self.vh.dtype)
 
     def forward(self, x, c, mask):
         batch_size = x.size(0)
@@ -159,10 +170,14 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, latent_size, num_labels, leaky_relu_slope=0.2, dropout_rate=0.2):
+    def __init__(self, latent_size, num_labels, leaky_relu_slope=0.2, dropout_rate=0.2,
+                 skip_noise_std=0.05):
         super().__init__()
         self.leaky_relu_slope = leaky_relu_slope
         self.dropout_rate = dropout_rate
+        # Fix 3: small Gaussian noise injected into skip connections during training
+        # to break the encoder short-circuit and force the latent space to be used.
+        self.skip_noise_std = skip_noise_std
         self.LD1 = nn.Linear(latent_size + num_labels, 3840)
 
         self.dec_conv7 = nn.Conv2d(512, 256, 3, stride=1, padding=1)
@@ -193,6 +208,12 @@ class Decoder(nn.Module):
         self.dec_conv0 = nn.Conv2d(16, 3, 3, stride=1, padding=1)
         self.dec_bn0 = nn.BatchNorm2d(3)
 
+    def _noisy_skip(self, s):
+        """Add small Gaussian noise to a skip-connection tensor during training."""
+        if self.training and self.skip_noise_std > 0.0:
+            return s + torch.randn_like(s) * self.skip_noise_std
+        return s
+
     def forward(self, z, c, skips):
         z_c = torch.cat((z, c), dim=-1)
         x = F.leaky_relu(self.LD1(z_c), negative_slope=self.leaky_relu_slope)
@@ -200,28 +221,28 @@ class Decoder(nn.Module):
 
         x = x.view(-1, 256, 5, 3)
 
-        x = torch.cat((x, skips['x7']), dim=1)
+        x = torch.cat((x, self._noisy_skip(skips['x7'])), dim=1)
         x = F.leaky_relu(self.dec_bn7(self.dec_conv7(x)), negative_slope=self.leaky_relu_slope)
 
-        x = torch.cat((x, skips['x6']), dim=1)
+        x = torch.cat((x, self._noisy_skip(skips['x6'])), dim=1)
         x = F.leaky_relu(self.dec_bn6(self.dec_conv6(x)), negative_slope=self.leaky_relu_slope)
 
         x = self.up5(x)
-        x = torch.cat((x, skips['x5']), dim=1)
+        x = torch.cat((x, self._noisy_skip(skips['x5'])), dim=1)
         x = F.leaky_relu(self.dec_bn5(self.dec_conv5(x)), negative_slope=self.leaky_relu_slope)
 
         x = self.up4(x)
-        x = torch.cat((x, skips['x4']), dim=1)
+        x = torch.cat((x, self._noisy_skip(skips['x4'])), dim=1)
         x = F.leaky_relu(self.dec_bn4(self.dec_conv4(x)), negative_slope=self.leaky_relu_slope)
 
-        x = torch.cat((x, skips['x3']), dim=1)
+        x = torch.cat((x, self._noisy_skip(skips['x3'])), dim=1)
         x = F.leaky_relu(self.dec_bn3(self.dec_conv3(x)), negative_slope=self.leaky_relu_slope)
 
         x = self.up2(x)
-        x = torch.cat((x, skips['x2']), dim=1)
+        x = torch.cat((x, self._noisy_skip(skips['x2'])), dim=1)
         x = F.leaky_relu(self.dec_bn2(self.dec_conv2(x)), negative_slope=self.leaky_relu_slope)
 
-        x = torch.cat((x, skips['x1']), dim=1)
+        x = torch.cat((x, self._noisy_skip(skips['x1'])), dim=1)
         x = F.leaky_relu(self.dec_bn1(self.dec_conv1(x)), negative_slope=self.leaky_relu_slope)
 
         x = self.up0(x)
@@ -245,13 +266,23 @@ def compute_vorticity_torch(img, tensor_X, tensor_Y):
 
 
 # ---------------------------------------------------------------------------
-# Loss function (unchanged from original)
+# Loss function
 # ---------------------------------------------------------------------------
 
 def loss_fn(recon_x, x, mean, log_var, mask, batch_clean, tensor_X, tensor_Y,
-            beta=0.001, gamma_base=0.0):
+            beta=0.001, gamma_base=0.0, lambda_free=0.5):
     BCE = torch.nn.functional.mse_loss(recon_x * mask, x * mask, reduction='mean')
-    KLD = -0.5 * torch.mean(1 + log_var - mean.pow(2) - log_var.exp())
+
+    # Fix 2: sum over latent dims then mean over batch, preventing the collapse
+    # from being hidden by averaging over the latent dimension.
+    # Fix 1: free-bits floor — each latent dim must contribute at least lambda_free
+    # nats to the KLD penalty. Dimensions already above the floor pass gradients
+    # normally; collapsed dims (KLD < lambda_free) receive zero gradient until
+    # they rise above the threshold.
+    # mean, log_var: (B, latent_size)
+    KLD_per_dim = -0.5 * (1.0 + log_var - mean.pow(2) - log_var.exp())  # (B, latent_size)
+    KLD_per_dim = torch.clamp(KLD_per_dim, min=lambda_free)              # free-bits floor
+    KLD = KLD_per_dim.sum(dim=1).mean()                                  # scalar
 
     coverage = mask[:, 0].mean()
     effective_gamma = gamma_base * (1.0 - coverage)
@@ -276,13 +307,14 @@ def _sigmoid(x):
 
 def compute_phased_coefficients(epoch, total_epochs, max_beta, max_gamma,
                                 beta_warm=1e-4, sigmoid_k=10.0,
-                                phase1_frac=0.20, phase2_frac=0.60):
+                                phase1_frac=0.20, phase2_frac=0.60,
+                                n_cycles=4):
     """
     Return (current_beta, current_gamma_base) for the given epoch according
     to the 3-phase schedule described in loss_scaling_plan.md.
 
     Phase 1  [0,         phase1_frac*N):  beta = beta_warm, gamma = 0
-    Phase 2  [phase1_frac*N, phase2_frac*N): beta sigmoid-ramp → max_beta, gamma = 0
+    Phase 2  [phase1_frac*N, phase2_frac*N): beta cyclical annealing → max_beta, gamma = 0
     Phase 3  [phase2_frac*N, N):           beta = max_beta (frozen), gamma linear → max_gamma
 
     Parameters
@@ -292,9 +324,13 @@ def compute_phased_coefficients(epoch, total_epochs, max_beta, max_gamma,
     max_beta      : ceiling value for beta (user input)
     max_gamma     : ceiling value for gamma_base (user input)
     beta_warm     : warm-start beta value used during Phase 1 (default 1e-4)
-    sigmoid_k     : steepness of the sigmoid ramp in Phase 2 (default 10)
+    sigmoid_k     : (unused, kept for backward-compat) steepness parameter
     phase1_frac   : fraction of total epochs defining end of Phase 1 (default 0.20)
     phase2_frac   : fraction of total epochs defining end of Phase 2 (default 0.60)
+    n_cycles      : number of annealing cycles within Phase 2 (default 4).
+                    Each cycle linearly ramps beta from 0 to max_beta in its first half,
+                    then holds max_beta for its second half — allowing the network to
+                    repeatedly escape posterior collapse before the final freeze.
 
     Returns
     -------
@@ -312,15 +348,19 @@ def compute_phased_coefficients(epoch, total_epochs, max_beta, max_gamma,
         phase_label = "P1-Recon"
 
     elif epoch < phase2_end:
-        # ---- Phase 2: sigmoid beta ramp, gamma still 0 ----
-        # Normalise epoch position within phase to [0, 1]; denominator is the
-        # full phase length so t reaches 1.0 at the start of Phase 3.
-        t = (epoch - phase1_end) / max(1, phase2_end - phase1_end)
-        # Sigmoid centred at t=0.5; normalised so output spans [0, 1]
-        raw_lo = _sigmoid(-sigmoid_k * 0.5)
-        raw_hi = _sigmoid(sigmoid_k * 0.5)
-        raw = _sigmoid(sigmoid_k * (t - 0.5))
-        current_beta = max_beta * (raw - raw_lo) / (raw_hi - raw_lo)
+        # ---- Phase 2: cyclical beta annealing, gamma still 0 ----
+        # Fix 4: divide Phase 2 into n_cycles equal cycles.  Within each cycle
+        # beta linearly ramps from 0 to max_beta in the first half, then holds
+        # max_beta for the second half.  This repeatedly restores the KLD
+        # gradient signal and prevents persistent posterior collapse.
+        t = (epoch - phase1_end) / max(1, phase2_end - phase1_end)  # [0, 1)
+        # Use integer cycle index to avoid float modulo precision issues.
+        cycle_idx = int(t * n_cycles)
+        cycle_t = t * n_cycles - cycle_idx  # fractional position in current cycle [0, 1)
+        if cycle_t < 0.5:
+            current_beta = max_beta * (cycle_t / 0.5)   # linear ramp 0 → max_beta
+        else:
+            current_beta = max_beta                       # hold at ceiling
         current_gamma_base = 0.0
         phase_label = "P2-KLD"
 
@@ -428,7 +468,10 @@ def train_cvae_phased(config, data_dict, device, outdir, is_ray_tune=False):
       beta_warm         – warm-start beta in Phase 1 (default 1e-4)
       phase1_frac       – fraction of epochs for Phase 1 (default 0.20)
       phase2_frac       – fraction of epochs marking end of Phase 2 (default 0.60)
-      sigmoid_k         – steepness of sigmoid beta ramp (default 10.0)
+      sigmoid_k         – (unused) kept for backward-compat (default 10.0)
+      lambda_free       – free-bits floor per latent dim (default 0.5)
+      skip_noise_std    – std of skip-connection noise in decoder (default 0.05)
+      n_cycles          – number of beta annealing cycles in Phase 2 (default 4)
     """
     Images = data_dict['Images']
     clabels = data_dict['clabels']
@@ -450,6 +493,7 @@ def train_cvae_phased(config, data_dict, device, outdir, is_ray_tune=False):
         ImgSizeY=48,
         leaky_relu_slope=config['leaky_relu_slope'],
         dropout_rate=config['dropout_rate'],
+        skip_noise_std=config.get('skip_noise_std', 0.05),
         vh=vh
     ).to(device=device)
 
@@ -478,6 +522,8 @@ def train_cvae_phased(config, data_dict, device, outdir, is_ray_tune=False):
     phase1_frac = config.get('phase1_frac', 0.20)
     phase2_frac = config.get('phase2_frac', 0.60)
     sigmoid_k = config.get('sigmoid_k', 10.0)
+    n_cycles = config.get('n_cycles', 4)
+    lambda_free = config.get('lambda_free', 0.5)
     total_epochs = config['epochs']
 
     for epoch in range(total_epochs):
@@ -486,7 +532,8 @@ def train_cvae_phased(config, data_dict, device, outdir, is_ray_tune=False):
         current_beta, current_gamma, phase_label = compute_phased_coefficients(
             epoch, total_epochs, max_beta, max_gamma,
             beta_warm=beta_warm, sigmoid_k=sigmoid_k,
-            phase1_frac=phase1_frac, phase2_frac=phase2_frac
+            phase1_frac=phase1_frac, phase2_frac=phase2_frac,
+            n_cycles=n_cycles
         )
 
         permutation = torch.randperm(Images.shape[0])
@@ -512,7 +559,8 @@ def train_cvae_phased(config, data_dict, device, outdir, is_ray_tune=False):
                 mask=batch_mask[:, 0:3],
                 batch_clean=batch_clean,
                 tensor_X=tensor_X, tensor_Y=tensor_Y,
-                beta=current_beta, gamma_base=current_gamma
+                beta=current_beta, gamma_base=current_gamma,
+                lambda_free=lambda_free
             )
 
             optimizer.zero_grad()
@@ -699,8 +747,11 @@ if __name__ == '__main__':
     parser.add_argument('-H', '--withHoles', dest='TrainHoles', type=int, default=1)
     parser.add_argument('-o', '--output', dest='oFile', type=str, default='CVAEoutput_phased.pkl')
     # 3-phase loss scaling parameters
-    parser.add_argument('--max_beta', type=float, default=5.0,
-                        help='Maximum beta (KLD weight); aim for weighted term β·KLD to be 10-30%% of BCE magnitude (default: 5.0)')
+    parser.add_argument('--max_beta', type=float, default=0.08,
+                        help='Maximum beta (KLD weight). With the new sum-KLD formulation the raw '
+                             'KLD value is ~latent_size× larger than with the old mean-KLD, so '
+                             'max_beta should be divided by latent_size relative to the old value '
+                             '(e.g. old max_beta=5, latent_size=64 → new max_beta≈0.08). (default: 0.08)')
     parser.add_argument('--max_gamma', type=float, default=1e-6,
                         help='Maximum gamma_base (vorticity loss weight) (default: 1e-6)')
     parser.add_argument('--beta_warm', type=float, default=1e-4,
@@ -710,7 +761,17 @@ if __name__ == '__main__':
     parser.add_argument('--phase2_frac', type=float, default=0.60,
                         help='Fraction of epochs marking end of Phase 2 – KLD ramp (default: 0.60)')
     parser.add_argument('--sigmoid_k', type=float, default=10.0,
-                        help='Sigmoid steepness for beta ramp in Phase 2 (default: 10.0)')
+                        help='(unused) Kept for backward compatibility (default: 10.0)')
+    parser.add_argument('--lambda_free', type=float, default=0.5,
+                        help='Free-bits floor per latent dim in nats; prevents posterior collapse '
+                             'by blocking gradients when a dim KLD is below this threshold (default: 0.5)')
+    parser.add_argument('--skip_noise_std', type=float, default=0.05,
+                        help='Std of Gaussian noise added to each encoder skip connection during '
+                             'training; forces the decoder to rely on the latent code (default: 0.05)')
+    parser.add_argument('--n_cycles', type=int, default=4,
+                        help='Number of beta annealing cycles in Phase 2; each cycle ramps beta '
+                             'from 0 to max_beta and holds, letting the network escape collapse '
+                             'repeatedly (default: 4)')
     # Ray Tune
     parser.add_argument('--tune', action='store_true', help='Run Ray Tune hyperparameter search')
     parser.add_argument('--tune_samples', type=int, default=10, help='Number of Ray Tune trials')
@@ -748,14 +809,21 @@ if __name__ == '__main__':
             'phase1_frac': args.phase1_frac,
             'phase2_frac': args.phase2_frac,
             'sigmoid_k': args.sigmoid_k,
+            # KLD fixes
+            'lambda_free': args.lambda_free,
+            'skip_noise_std': args.skip_noise_std,
+            'n_cycles': args.n_cycles,
             'n_valid': args.nValid,
             'output_file': args.oFile,
         }
 
         print("3-phase loss scheduling configuration:")
         print(f"  Phase 1 (0 – {args.phase1_frac*100:.0f}%): beta_warm={args.beta_warm:.1e}, gamma=0")
-        print(f"  Phase 2 ({args.phase1_frac*100:.0f}% – {args.phase2_frac*100:.0f}%): beta sigmoid 0→{args.max_beta}, gamma=0")
-        print(f"  Phase 3 ({args.phase2_frac*100:.0f}% – 100%): beta={args.max_beta} (frozen), gamma linear 0→{args.max_gamma:.1e}")
+        print(f"  Phase 2 ({args.phase1_frac*100:.0f}% – {args.phase2_frac*100:.0f}%): "
+              f"beta cyclical 0→{args.max_beta} ({args.n_cycles} cycles), gamma=0")
+        print(f"  Phase 3 ({args.phase2_frac*100:.0f}% – 100%): beta={args.max_beta} (frozen), "
+              f"gamma linear 0→{args.max_gamma:.1e}")
+        print(f"  KLD fixes: lambda_free={args.lambda_free}, skip_noise_std={args.skip_noise_std}")
         print("Starting training...")
 
         start = time.time()
